@@ -3,6 +3,7 @@ import os
 import sqlite3
 import shutil
 import calendar
+import re
 from datetime import datetime, timedelta
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
                                QVBoxLayout, QPushButton, QLabel, QScrollArea, 
@@ -11,9 +12,11 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout,
                                QLineEdit, QDateEdit, QFormLayout, QDialogButtonBox,
                                QGridLayout, QFileDialog, QStackedWidget, QTableView,
                                QListWidgetItem, QGraphicsDropShadowEffect, QSizePolicy,
-                               QStyle, QCheckBox, QRadioButton, QButtonGroup)
-from PySide6.QtCore import Qt, QDate, QTimer, QEvent, QLocale, QPoint, QSize
+                               QStyle, QCheckBox, QRadioButton, QButtonGroup, QComboBox,
+                               QAbstractItemView)
+from PySide6.QtCore import Qt, QDate, QTimer, QEvent, QLocale, QPoint, QSize, Signal, QTranslator, QLibraryInfo
 from PySide6.QtGui import QPainter, QColor, QFont, QIcon
+from PySide6.QtTest import QTest
 
 
 def get_db_path():
@@ -50,10 +53,10 @@ TRANSLATIONS = {
         "recur_label": "Повторение:", "client_name": "Имя клиента:", "client_desc": "Описание:",
         "pin_client": "📌 Закрепить клиента", "search_clients_placeholder": "Поиск по клиентам...", "clear_search": "✖ Снять фильтр",
         "edit_client": "✏️ Редактировать клиента", "delete_client": "❌ Удалить клиента", "go_to_client": "Перейти",
-        "pinned": "📌 ", "in_archive": "В архиве",
-        "reminders_title": "Напоминания", "reminder_clear": "Ясно",
+        "pinned": "📌 ", "in_archive": "В архиве", "import_btn": "Импорт", "export_btn": "Экспорт",
+        "reminders_title": "Напоминания", "reminder_clear": "Не напоминать",
         "reminder_snooze": "Напомнить завтра", "reminder_go": "Перейти",
-        "reminders_tooltip": "Напоминания"
+        "reminders_tooltip": "Напоминания", "to_important": "⭐ В Важные", "remove_important": "⭐ Снять важность"
     },
     "EN": {
         "general": "General", "add_client": "+ Add Client", "all_clients": "All Clients",
@@ -70,12 +73,21 @@ TRANSLATIONS = {
         "recur_label": "Recurrence:", "client_name": "Client name:", "client_desc": "Description:",
         "pin_client": "📌 Pin client", "search_clients_placeholder": "Search clients...", "clear_search": "✖ Clear filter",
         "edit_client": "✏️ Edit client", "delete_client": "❌ Delete client", "go_to_client": "Go to",
-        "pinned": "📌 ", "in_archive": "In archive",
-        "reminders_title": "Reminders", "reminder_clear": "Got it",
+        "pinned": "📌 ", "in_archive": "In archive", "import_btn": "Import", "export_btn": "Export",
+        "reminders_title": "Reminders", "reminder_clear": "Don't remind",
         "reminder_snooze": "Remind tomorrow", "reminder_go": "Go to",
-        "reminders_tooltip": "Reminders"
+        "reminders_tooltip": "Reminders", "to_important": "⭐ To Important", "remove_important": "⭐ Remove Important"
     }
 }
+
+MONTHS_RU = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+MONTHS_EN = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+
+
+def format_date_words(date_obj, lang):
+    if not date_obj or date_obj == datetime.max: return ""
+    months = MONTHS_RU if lang == "RU" else MONTHS_EN
+    return f"{date_obj.day:02d} {months[date_obj.month-1]} {date_obj.year}"
 
 
 def add_months(sourcedate, months):
@@ -84,6 +96,26 @@ def add_months(sourcedate, months):
     month = month % 12 + 1
     day = min(sourcedate.day, calendar.monthrange(year, month)[1])
     return datetime(year, month, day)
+
+
+def get_next_occurrence(deadline_str, recurrence):
+    if not deadline_str: return datetime.max
+    try:
+        d, m, y = map(int, deadline_str.split('.'))
+        base = datetime(y, m, d)
+    except: return datetime.max
+    
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    if recurrence == 'none' or not recurrence:
+        return base
+        
+    current = base
+    while current < today:
+        if recurrence == 'weekly': current += timedelta(days=7)
+        elif recurrence == 'monthly': current = add_months(current, 1)
+        elif recurrence == 'yearly': current = add_months(current, 12)
+        else: break
+    return current
 
 
 def get_all_occurrences(deadline_str, recurrence, max_date):
@@ -121,6 +153,25 @@ def is_task_on_date(deadline_str, recurrence, target_qdate):
     return False
 
 
+class ClickableLabel(QLabel):
+    clicked = Signal()
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.drag_start = None
+        self.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.setCursor(Qt.IBeamCursor)
+        
+    def mousePressEvent(self, event):
+        self.drag_start = event.position().toPoint()
+        super().mousePressEvent(event)
+        
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.drag_start:
+            if (event.position().toPoint() - self.drag_start).manhattanLength() < QApplication.startDragDistance():
+                self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
 class MultiLineElidedLabel(QLabel):
     def __init__(self, text="", parent=None):
         super().__init__(text, parent)
@@ -130,6 +181,7 @@ class MultiLineElidedLabel(QLabel):
         self.setMinimumHeight(fm.lineSpacing() * self.lines_limit)
         self.setMaximumHeight(fm.lineSpacing() * self.lines_limit)
         self.setStyleSheet("color: #5f6368; font-size: 12px;")
+        self.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -169,6 +221,7 @@ class MultiLineElidedLabel(QLabel):
 
 
 class MiniCalendar(QCalendarWidget):
+    add_task_requested = Signal(QDate)
     def __init__(self, parent=None):
         super().__init__(parent)
         self.dates_with_tasks = set()
@@ -182,10 +235,29 @@ class MiniCalendar(QCalendarWidget):
             self.view.viewport().installEventFilter(self)
             self.view.clicked.connect(self.handle_table_click)
             self.view.doubleClicked.connect(self.handle_table_click)
+            
+            self.view.setContextMenuPolicy(Qt.CustomContextMenu)
+            self.view.customContextMenuRequested.connect(self.show_context_menu)
+
+    def show_context_menu(self, pos):
+        if not self.view: return
+        self.blockSignals(True)
+        QTest.mouseClick(self.view.viewport(), Qt.LeftButton, Qt.NoModifier, pos)
+        self.blockSignals(False)
+        
+        index = self.view.indexAt(pos)
+        if index.isValid():
+            date = self.selectedDate()
+            if date.isValid():
+                menu = QMenu(self)
+                lang = self.window().current_lang if hasattr(self.window(), 'current_lang') else "RU"
+                action = menu.addAction("Добавить задачу" if lang == "RU" else "Add Task")
+                action.triggered.connect(lambda checked=False: self.add_task_requested.emit(date))
+                menu.exec(self.view.viewport().mapToGlobal(pos))
 
     def handle_table_click(self, index):
         if index.isValid():
-            date = self.dateForCell(index.row(), index.column())
+            date = self.selectedDate()
             if date.isValid():
                 m = self.monthShown() or QDate.currentDate().month()
                 y = self.yearShown() or QDate.currentDate().year()
@@ -213,26 +285,54 @@ class MiniCalendar(QCalendarWidget):
             return
         painter.save()
         is_task_date = date in self.dates_with_tasks
-        is_today = date == QDate.currentDate() 
-        if is_today:
-            painter.fillRect(rect, QColor("#e8f0fe")) 
-            painter.setPen(QColor("#1967d2"))
-        elif is_task_date:
-            painter.fillRect(rect, QColor("#FFEB3B")) 
-            painter.setPen(Qt.black) 
+        is_today = date == QDate.currentDate()
+        
+        if is_task_date:
+            painter.fillRect(rect, QColor("#FFEB3B"))
         else:
             painter.fillRect(rect, Qt.white)
-            if date.dayOfWeek() in (6, 7): painter.setPen(QColor("#c5221f")) 
-            else: painter.setPen(Qt.black)
+            
+        if is_today:
+            painter.setPen(QColor(0, 0, 0))
+            painter.drawRect(rect.adjusted(1, 1, -1, -1))
+            painter.drawRect(rect.adjusted(2, 2, -2, -2))
+        else:
+            if date.dayOfWeek() in (6, 7): 
+                painter.setPen(QColor("#c5221f")) 
+            else: 
+                painter.setPen(Qt.black)
+                
         painter.drawText(rect, Qt.AlignCenter, str(date.day()))
         painter.restore()
 
 
 class CustomCalendar(QCalendarWidget):
+    add_task_requested = Signal(QDate)
     def __init__(self, parent=None):
         super().__init__(parent)
         self.dates_with_tasks = set()
         self.setVerticalHeaderFormat(QCalendarWidget.NoVerticalHeader)
+        
+        self.view = self.findChild(QTableView)
+        if self.view:
+            self.view.setContextMenuPolicy(Qt.CustomContextMenu)
+            self.view.customContextMenuRequested.connect(self.show_context_menu)
+
+    def show_context_menu(self, pos):
+        if not self.view: return
+        self.blockSignals(True)
+        QTest.mouseClick(self.view.viewport(), Qt.LeftButton, Qt.NoModifier, pos)
+        self.blockSignals(False)
+        
+        index = self.view.indexAt(pos)
+        if index.isValid():
+            date = self.selectedDate()
+            if date.isValid():
+                menu = QMenu(self)
+                lang = self.window().current_lang if hasattr(self.window(), 'current_lang') else "RU"
+                action = menu.addAction("Добавить задачу" if lang == "RU" else "Add Task")
+                action.triggered.connect(lambda checked=False: self.add_task_requested.emit(date))
+                menu.exec(self.view.viewport().mapToGlobal(pos))
 
     def set_task_dates(self, dates):
         self.dates_with_tasks = dates
@@ -247,29 +347,48 @@ class CustomCalendar(QCalendarWidget):
         painter.save()
         is_task_date = date in self.dates_with_tasks
         is_today = date == QDate.currentDate()
-        if is_today:
-            painter.fillRect(rect, QColor("#1a73e8")) 
-            painter.setPen(Qt.white)
-        elif is_task_date:
-            painter.fillRect(rect, QColor("#FFEB3B")) 
-            painter.setPen(Qt.black)
+        
+        if is_task_date:
+            painter.fillRect(rect, QColor("#FFEB3B"))
         else:
             painter.fillRect(rect, Qt.white)
-            if date.dayOfWeek() in (6, 7): painter.setPen(QColor("#c5221f")) 
-            else: painter.setPen(Qt.black)
+            
+        if is_today:
+            painter.setPen(QColor(0, 0, 0))
+            painter.drawRect(rect.adjusted(1, 1, -1, -1))
+            painter.drawRect(rect.adjusted(2, 2, -2, -2))
+        else:
+            if date.dayOfWeek() in (6, 7): 
+                painter.setPen(QColor("#c5221f")) 
+            else: 
+                painter.setPen(Qt.black)
+                
         painter.drawText(rect, Qt.AlignCenter, str(date.day()))
         painter.restore()
 
 
 class TaskDialog(QDialog):
-    def __init__(self, parent=None, title_text="", default_qdate=None, recurrence='none'):
+    def __init__(self, parent=None, title_text="", default_qdate=None, recurrence='none', client_id=None):
         super().__init__(parent)
         self.current_lang = parent.current_lang if parent else "RU"
         is_ru = self.current_lang == "RU"
         t = TRANSLATIONS[self.current_lang]
         self.setWindowTitle("Задача" if is_ru else "Task")
-        self.resize(400, 250)
+        self.resize(400, 320)
         layout = QFormLayout(self)
+        
+        self.client_combo = None
+        if parent and parent.current_client_id is None and client_id is None:
+            self.client_combo = QComboBox()
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, name FROM clients WHERE name != 'Общий' AND is_archived = 0 ORDER BY name")
+            clients = cursor.fetchall()
+            conn.close()
+            for cid, cname in clients:
+                self.client_combo.addItem(cname, cid)
+            layout.addRow("Клиент:" if is_ru else "Client:", self.client_combo)
+            
         self.title_input = QLineEdit()
         self.title_input.setPlaceholderText("Например: Оплатить хостинг..." if is_ru else "Example: Pay for hosting...")
         self.title_input.setText(title_text)
@@ -311,6 +430,7 @@ class TaskDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
+        
     def get_recurrence(self):
         if self.radio_weekly.isChecked(): return 'weekly'
         if self.radio_monthly.isChecked(): return 'monthly'
@@ -406,8 +526,84 @@ class ClientDialog(QDialog):
         layout.addRow(buttons)
 
 
+class SelectTaskDialog(QDialog):
+    def __init__(self, parent, tasks_data, date_str):
+        super().__init__(parent)
+        self.current_lang = parent.current_lang
+        is_ru = self.current_lang == "RU"
+        self.setWindowTitle("Выбор задачи" if is_ru else "Select Task")
+        self.resize(500, 400)
+        self.selected_task_id = None
+        self.selected_client_id = None
+        
+        layout = QVBoxLayout(self)
+        lbl_info = QLabel(f"На {date_str} найдено несколько задач.\nВыберите нужную:" if is_ru else f"Found multiple tasks on {date_str}.\nSelect one:")
+        lbl_info.setStyleSheet("font-size: 14px; margin-bottom: 10px;")
+        layout.addWidget(lbl_info)
+        
+        self.list_widget = QListWidget()
+        self.list_widget.setStyleSheet("QListWidget { border: 1px solid #dadce0; border-radius: 8px; background-color: #ffffff; } QListWidget::item { border-bottom: 1px solid #f1f3f4; } QListWidget::item:selected { background-color: #e8f0fe; color: #202124; }")
+        self.list_widget.setDragEnabled(False)
+        
+        for task_id, title, client_id, client_name, deadline, recurrence in tasks_data:
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, (task_id, client_id))
+            
+            widget = QWidget()
+            w_layout = QVBoxLayout(widget)
+            w_layout.setContentsMargins(10, 8, 10, 8)
+            w_layout.setSpacing(2)
+            widget.setStyleSheet("background: transparent;")
+            
+            title_lbl = ClickableLabel(title)
+            title_lbl.setStyleSheet("font-weight: bold; font-size: 14px; color: #202124; background: transparent;")
+            title_lbl.clicked.connect(lambda checked=False, it=item: self.list_widget.setCurrentItem(it))
+            
+            next_occ = get_next_occurrence(deadline, recurrence)
+            date_text = f"➔ {format_date_words(next_occ, self.current_lang)}"
+            if recurrence != 'none':
+                recur_text = TRANSLATIONS[self.current_lang].get(f"recur_{recurrence}_short", "")
+                date_text += f" ({recur_text})"
+                
+            date_lbl = ClickableLabel(date_text)
+            date_lbl.setStyleSheet("font-size: 12px; color: #5f6368; background: transparent;")
+            date_lbl.clicked.connect(lambda checked=False, it=item: self.list_widget.setCurrentItem(it))
+            
+            client_lbl = ClickableLabel(f"👤 {client_name}")
+            client_lbl.setStyleSheet("font-size: 12px; color: #5f6368; background: transparent;")
+            client_lbl.clicked.connect(lambda checked=False, it=item: self.list_widget.setCurrentItem(it))
+            
+            w_layout.addWidget(title_lbl)
+            w_layout.addWidget(date_lbl)
+            w_layout.addWidget(client_lbl)
+            
+            item.setSizeHint(widget.sizeHint())
+            self.list_widget.addItem(item)
+            self.list_widget.setItemWidget(item, widget)
+            
+        self.list_widget.itemDoubleClicked.connect(self.accept)
+        layout.addWidget(self.list_widget)
+        
+        btn_layout = QHBoxLayout()
+        btn_go = QPushButton("Перейти" if is_ru else "Go")
+        btn_go.setObjectName("primaryBtn")
+        btn_go.clicked.connect(self.accept)
+        btn_cancel = QPushButton("Отмена" if is_ru else "Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_go)
+        btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
+        
+    def accept(self):
+        item = self.list_widget.currentItem()
+        if item:
+            self.selected_task_id, self.selected_client_id = item.data(Qt.UserRole)
+            super().accept()
+
+
 class ReminderPopup(QWidget):
-    """Полупрозрачная всплывающая панель напоминаний в левом нижнем углу окна."""
     def __init__(self, main_window):
         super().__init__(main_window)
         self.main_window = main_window
@@ -466,14 +662,12 @@ class ReminderPopup(QWidget):
         self.title.setText(TRANSLATIONS[self.main_window.current_lang]["reminders_title"])
 
     def refresh(self, reminders):
-        # Очищаем всё, кроме растяжки в конце
         while self.items_layout.count() > 1:
             item = self.items_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        if not reminders:
-            return
+        if not reminders: return
 
         t = TRANSLATIONS[self.main_window.current_lang]
 
@@ -541,8 +735,6 @@ class ReminderPopup(QWidget):
 
             cl.addLayout(btns)
             self.items_layout.insertWidget(self.items_layout.count() - 1, card)
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -562,6 +754,10 @@ class MainWindow(QMainWindow):
         self.all_clients_filter = ""
         self.reminder_popup_dismissed = False
         self.reminder_popup = None
+        
+        self.app_translator = QTranslator()
+        self.update_translator()
+
         self.init_db()
 
         central_widget = QWidget()
@@ -657,6 +853,7 @@ class MainWindow(QMainWindow):
         gen_left_layout.addWidget(self.gen_tasks_title)
         self.general_tasks_list = QListWidget()
         self.general_tasks_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.general_tasks_list.setDragEnabled(False)
         self.general_tasks_list.itemClicked.connect(self.on_general_task_clicked)
         gen_left_layout.addWidget(self.general_tasks_list, 1) 
         search_container = QWidget()
@@ -749,10 +946,9 @@ class MainWindow(QMainWindow):
         self.tasks_list = QListWidget()
         self.tasks_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.tasks_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.tasks_list.setDragEnabled(False)
         self.tasks_list.itemClicked.connect(self.on_task_clicked)
         self.tasks_list.itemDoubleClicked.connect(self.edit_task_dialog) 
-        self.tasks_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.tasks_list.customContextMenuRequested.connect(self.show_task_context_menu)
         left_layout.addWidget(self.tasks_list, 3) 
         self.important_title = QLabel("Важные задачи")
         self.important_title.setObjectName("sectionTitle")
@@ -760,16 +956,29 @@ class MainWindow(QMainWindow):
         self.important_list = QListWidget()
         self.important_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.important_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.important_list.setDragEnabled(False)
         self.important_list.itemClicked.connect(self.on_task_clicked)
         self.important_list.itemDoubleClicked.connect(self.edit_task_dialog) 
-        self.important_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.important_list.customContextMenuRequested.connect(self.show_task_context_menu)
         left_layout.addWidget(self.important_list, 2) 
+        
         contacts_header = QHBoxLayout()
         self.contacts_title = QLabel("Контакты")
         self.contacts_title.setObjectName("sectionTitle")
         contacts_header.addWidget(self.contacts_title)
         contacts_header.addStretch()
+        
+        self.btn_import_contacts = QPushButton("Импорт")
+        self.btn_import_contacts.setStyleSheet("QPushButton { background-color: #f1f3f4; border-radius: 4px; padding: 4px 10px; font-size: 12px; } QPushButton:hover { background-color: #e8eaed; }")
+        self.btn_import_contacts.setCursor(Qt.PointingHandCursor)
+        self.btn_import_contacts.clicked.connect(self.import_contacts)
+        contacts_header.addWidget(self.btn_import_contacts)
+        
+        self.btn_export_contacts = QPushButton("Экспорт")
+        self.btn_export_contacts.setStyleSheet("QPushButton { background-color: #f1f3f4; border-radius: 4px; padding: 4px 10px; font-size: 12px; } QPushButton:hover { background-color: #e8eaed; }")
+        self.btn_export_contacts.setCursor(Qt.PointingHandCursor)
+        self.btn_export_contacts.clicked.connect(self.export_contacts)
+        contacts_header.addWidget(self.btn_export_contacts)
+        
         btn_add_contact = QPushButton("+")
         btn_add_contact.setObjectName("iconBtn")
         btn_add_contact.setCursor(Qt.PointingHandCursor)
@@ -779,6 +988,7 @@ class MainWindow(QMainWindow):
         self.contacts_list = QListWidget()
         self.contacts_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.contacts_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.contacts_list.setDragEnabled(False)
         self.contacts_list.itemDoubleClicked.connect(self.edit_contact_dialog)
         self.contacts_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.contacts_list.customContextMenuRequested.connect(self.show_contact_context_menu)
@@ -798,6 +1008,7 @@ class MainWindow(QMainWindow):
         self.client_files_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.client_files_list.setFixedHeight(250) 
         self.client_files_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.client_files_list.setDragEnabled(False)
         self.client_files_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.client_files_list.customContextMenuRequested.connect(self.show_file_context_menu)
         left_layout.addWidget(self.client_files_list)
@@ -807,9 +1018,46 @@ class MainWindow(QMainWindow):
         center_widget.setObjectName("centerPanel")
         center_layout = QVBoxLayout(center_widget)
         center_layout.setContentsMargins(20, 20, 20, 20)
-        self.task_title = QLabel("Выберите задачу слева")
-        self.task_title.setObjectName("activeTaskTitle")
-        center_layout.addWidget(self.task_title)
+        
+        self.task_header_container = QWidget()
+        self.task_header_layout = QVBoxLayout(self.task_header_container)
+        self.task_header_layout.setContentsMargins(0, 0, 0, 0)
+        self.task_header_layout.setSpacing(5)
+        
+        # Новый фрейм для заголовка с кнопками
+        self.task_title_frame = QFrame()
+        self.task_title_frame.setStyleSheet("QFrame { background-color: #e8f0fe; border-radius: 6px; }")
+        self.task_title_layout = QHBoxLayout(self.task_title_frame)
+        self.task_title_layout.setContentsMargins(10, 5, 10, 5)
+        self.task_title_layout.setSpacing(10)
+
+        self.task_title_label = QLabel("Выберите задачу слева")
+        self.task_title_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #202124; background: transparent;")
+        self.task_title_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.task_title_layout.addWidget(self.task_title_label, 1) # Растягиваем заголовок на всё свободное место
+
+        self.btn_task_important = QPushButton("⭐ В Важные")
+        self.btn_task_important.setCursor(Qt.PointingHandCursor)
+        self.btn_task_important.setStyleSheet("QPushButton { background-color: #fbbc04; color: #202124; border-radius: 4px; padding: 6px 12px; font-weight: bold; font-size: 12px; border: none; } QPushButton:hover { background-color: #f9ab00; }")
+        self.btn_task_important.clicked.connect(self.toggle_current_task_important)
+        self.btn_task_important.hide()
+        self.task_title_layout.addWidget(self.btn_task_important)
+
+        self.btn_task_archive = QPushButton("📦 В архив")
+        self.btn_task_archive.setCursor(Qt.PointingHandCursor)
+        self.btn_task_archive.setStyleSheet("QPushButton { background-color: #f1f3f4; color: #202124; border-radius: 4px; padding: 6px 12px; font-weight: bold; font-size: 12px; border: none; } QPushButton:hover { background-color: #e8eaed; }")
+        self.btn_task_archive.clicked.connect(self.archive_current_task)
+        self.btn_task_archive.hide()
+        self.task_title_layout.addWidget(self.btn_task_archive)
+
+        self.task_dates_label = QLabel("")
+        self.task_dates_label.setStyleSheet("color: #5f6368; font-size: 13px; padding-left: 5px;")
+        self.task_dates_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        
+        self.task_header_layout.addWidget(self.task_title_frame)
+        self.task_header_layout.addWidget(self.task_dates_label)
+        center_layout.addWidget(self.task_header_container)
+
         posts_area = QScrollArea()
         posts_area.setWidgetResizable(True)
         posts_area.setStyleSheet("background-color: transparent; border: none;")
@@ -865,6 +1113,7 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(task_files_header)
         self.task_files_list = QListWidget()
         self.task_files_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.task_files_list.setDragEnabled(False)
         self.task_files_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.task_files_list.customContextMenuRequested.connect(self.show_file_context_menu)
         right_layout.addWidget(self.task_files_list, 1) 
@@ -883,6 +1132,7 @@ class MainWindow(QMainWindow):
         self.calendar = CustomCalendar()
         self.calendar.clicked.connect(self.on_calendar_clicked)
         self.calendar.activated.connect(self.on_calendar_double_clicked) 
+        self.calendar.add_task_requested.connect(self.add_task_dialog)
         self.calendar.setStyleSheet("QCalendarWidget QWidget { background-color: #ffffff; } QCalendarWidget QToolButton { color: #3c4043; background-color: transparent; border: none; padding: 5px; } QCalendarWidget QAbstractItemView:enabled { background-color: #ffffff; color: #3c4043; }")
         right_layout.addWidget(self.calendar)
         splitter.addWidget(left_scroll)
@@ -914,6 +1164,7 @@ class MainWindow(QMainWindow):
         arch_layout.addLayout(arch_header)
         self.archive_list = QListWidget()
         self.archive_list.setStyleSheet("QListWidget { border: 1px solid #dadce0; border-radius: 8px; background-color: #ffffff; } QListWidget::item { border-bottom: 1px solid #f1f3f4; padding: 0px; }")
+        self.archive_list.setDragEnabled(False)
         arch_layout.addWidget(self.archive_list)
         self.stacked_widget.addWidget(self.archive_page)
 
@@ -954,6 +1205,7 @@ class MainWindow(QMainWindow):
         all_clients_layout.addLayout(search_layout)
         self.all_clients_list = QListWidget()
         self.all_clients_list.setStyleSheet("QListWidget { border: 1px solid #dadce0; border-radius: 8px; background-color: #ffffff; } QListWidget::item { border-bottom: 1px solid #f1f3f4; padding: 0px; }")
+        self.all_clients_list.setDragEnabled(False)
         self.all_clients_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.all_clients_list.customContextMenuRequested.connect(self.show_all_clients_item_context_menu)
         all_clients_layout.addWidget(self.all_clients_list)
@@ -989,7 +1241,6 @@ class MainWindow(QMainWindow):
         self.btn_lang.clicked.connect(self.toggle_language)
         bottom_layout.addWidget(self.btn_lang)
 
-        # Жёлтая кнопка напоминаний
         self.btn_reminders = QPushButton("!")
         self.btn_reminders.setFixedSize(24, 20)
         self.btn_reminders.setCursor(Qt.PointingHandCursor)
@@ -1012,21 +1263,27 @@ class MainWindow(QMainWindow):
         self.show_general_view()
         QTimer.singleShot(100, self.scroll_to_current_month)
 
-        # --- Система напоминаний ---
         self.reminder_popup = ReminderPopup(self)
         self.reminder_timer = QTimer(self)
         self.reminder_timer.timeout.connect(self.check_reminders)
-        self.reminder_timer.start(2 * 60 * 60 * 1000)  # каждые 2 часа
-        QTimer.singleShot(1500, self.check_reminders)   # первичная проверка после старта
+        self.reminder_timer.start(2 * 60 * 60 * 1000)
+        QTimer.singleShot(1500, self.check_reminders)
 
+    def update_translator(self):
+        QApplication.instance().removeTranslator(self.app_translator)
+        if self.current_lang == "RU":
+            if self.app_translator.load("qtbase_ru", QLibraryInfo.path(QLibraryInfo.TranslationsPath)):
+                QApplication.instance().installTranslator(self.app_translator)
+        else:
+            if self.app_translator.load("qtbase_en", QLibraryInfo.path(QLibraryInfo.TranslationsPath)):
+                QApplication.instance().installTranslator(self.app_translator)
     # ================== РАБОТА С НАПОМИНАНИЯМИ ==================
 
     def check_reminders(self):
-        """Проверка дедлайнов активных задач + очистка старых напоминаний."""
-        if self.reminder_popup is None:
-            return
+        if self.reminder_popup is None: return
         now = datetime.now()
         max_past = now - timedelta(days=90)
+        max_future = now + timedelta(days=3)
         new_pending_created = False
 
         conn = sqlite3.connect(DB_PATH)
@@ -1040,31 +1297,25 @@ class MainWindow(QMainWindow):
         tasks = cursor.fetchall()
 
         for task_id, client_id, title, deadline_str, recurrence in tasks:
-            if not deadline_str:
-                continue
+            if not deadline_str: continue
             try:
                 d, m, y = map(int, deadline_str.split('.'))
                 base = datetime(y, m, d)
-            except Exception:
-                continue
+            except Exception: continue
 
             occurrences = []
             if recurrence == 'none' or not recurrence:
-                if max_past <= base <= now:
+                if max_past <= base <= max_future:
                     occurrences.append(base)
             else:
                 current = base
-                while current <= now:
+                while current <= max_future:
                     if current >= max_past:
                         occurrences.append(current)
-                    if recurrence == 'weekly':
-                        current += timedelta(days=7)
-                    elif recurrence == 'monthly':
-                        current = add_months(current, 1)
-                    elif recurrence == 'yearly':
-                        current = add_months(current, 12)
-                    else:
-                        break
+                    if recurrence == 'weekly': current += timedelta(days=7)
+                    elif recurrence == 'monthly': current = add_months(current, 1)
+                    elif recurrence == 'yearly': current = add_months(current, 12)
+                    else: break
 
             for occ in occurrences:
                 occ_str = occ.strftime("%d.%m.%Y")
@@ -1075,28 +1326,17 @@ class MainWindow(QMainWindow):
                 existing = cursor.fetchone()
                 if existing:
                     rid, status, snooze_until = existing
-                    if status == 'cleared':
-                        continue
+                    if status == 'cleared': continue
                     if status == 'snoozed' and snooze_until:
                         try:
                             su = datetime.strptime(snooze_until, "%d.%m.%Y %H:%M")
-                            if su > now:
-                                continue
-                        except Exception:
-                            pass
-                        cursor.execute(
-                            "UPDATE reminders SET status='pending', snooze_until=NULL WHERE id=?",
-                            (rid,)
-                        )
+                            if su > now: continue
+                        except Exception: pass
+                        cursor.execute("UPDATE reminders SET status='pending', snooze_until=NULL WHERE id=?", (rid,))
                 else:
-                    cursor.execute(
-                        "INSERT INTO reminders (task_id, occurrence_date, status, snooze_until) "
-                        "VALUES (?, ?, 'pending', NULL)",
-                        (task_id, occ_str)
-                    )
+                    cursor.execute("INSERT INTO reminders (task_id, occurrence_date, status, snooze_until) VALUES (?, ?, 'pending', NULL)", (task_id, occ_str))
                     new_pending_created = True
 
-        # Очистка записей старше 3 месяцев
         cutoff = now - timedelta(days=90)
         cursor.execute("SELECT id, occurrence_date FROM reminders")
         for rid, occ_str in cursor.fetchall():
@@ -1104,8 +1344,7 @@ class MainWindow(QMainWindow):
                 occ_date = datetime.strptime(occ_str, "%d.%m.%Y")
                 if occ_date < cutoff:
                     cursor.execute("DELETE FROM reminders WHERE id = ?", (rid,))
-            except Exception:
-                pass
+            except Exception: pass
 
         conn.commit()
         conn.close()
@@ -1116,8 +1355,7 @@ class MainWindow(QMainWindow):
         self.load_active_reminders()
 
     def load_active_reminders(self):
-        if self.reminder_popup is None:
-            return
+        if self.reminder_popup is None: return
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute("""
@@ -1147,16 +1385,14 @@ class MainWindow(QMainWindow):
             self.reminder_popup.raise_()
 
     def position_reminder_popup(self):
-        if self.reminder_popup is None:
-            return
+        if self.reminder_popup is None: return
         self.reminder_popup.adjustSize()
         max_h = max(200, self.height() - 130)
         if self.reminder_popup.height() > max_h:
             self.reminder_popup.resize(self.reminder_popup.width(), max_h)
         x = 15
         y = self.height() - self.reminder_popup.height() - 45
-        if y < 80:
-            y = 80
+        if y < 80: y = 80
         self.reminder_popup.move(x, y)
 
     def show_reminder_popup(self):
@@ -1181,10 +1417,7 @@ class MainWindow(QMainWindow):
         snooze_until = tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE reminders SET status='snoozed', snooze_until=? WHERE id = ?",
-            (snooze_until.strftime("%d.%m.%Y %H:%M"), reminder_id)
-        )
+        cursor.execute("UPDATE reminders SET status='snoozed', snooze_until=? WHERE id = ?", (snooze_until.strftime("%d.%m.%Y %H:%M"), reminder_id))
         conn.commit()
         conn.close()
         self.load_active_reminders()
@@ -1263,7 +1496,6 @@ class MainWindow(QMainWindow):
         cursor.execute('''CREATE TABLE IF NOT EXISTS posts (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER, date TEXT, text TEXT)''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, name TEXT, description TEXT, phone1 TEXT, phone2 TEXT, phone3 TEXT, email1 TEXT, email2 TEXT, email3 TEXT)''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, task_id INTEGER, post_id INTEGER, file_name TEXT, file_path TEXT, description TEXT)''')
-        # Таблица напоминаний
         cursor.execute('''CREATE TABLE IF NOT EXISTS reminders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             task_id INTEGER NOT NULL,
@@ -1288,6 +1520,7 @@ class MainWindow(QMainWindow):
     def toggle_language(self):
         self.current_lang = "EN" if self.current_lang == "RU" else "RU"
         self.btn_lang.setText(self.current_lang) 
+        self.update_translator()
         new_locale = QLocale("en_US") if self.current_lang == "EN" else QLocale("ru_RU")
         self.calendar.setLocale(new_locale)
         self.build_general_calendar()
@@ -1308,6 +1541,8 @@ class MainWindow(QMainWindow):
         self.tasks_title.setText(t["tasks"])
         self.important_title.setText(t["important"])
         self.contacts_title.setText(t["contacts"])
+        self.btn_import_contacts.setText(t["import_btn"])
+        self.btn_export_contacts.setText(t["export_btn"])
         self.client_files_title.setText(t["client_files"])
         self.reset_filter_btn.setText(t["reset_filter"])
         self.arch_title.setText(t["archive_title"])
@@ -1316,7 +1551,25 @@ class MainWindow(QMainWindow):
         self.btn_delete_selected_arch.setText(t["delete_selected"])
         self.btn_delete_selected_clients.setText(t["delete_selected"])
         self.btn_archive_selected_clients.setText(t["to_archive"])
-        if not self.current_task_id: self.task_title.setText(t["select_task"])
+        
+        # Новые кнопки
+        self.btn_task_archive.setText(t["to_archive"])
+        if self.current_task_id:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("SELECT is_important FROM tasks WHERE id = ?", (self.current_task_id,))
+            row = cursor.fetchone()
+            conn.close()
+            if row and row[0]:
+                self.btn_task_important.setText(t["remove_important"])
+            else:
+                self.btn_task_important.setText(t["to_important"])
+        else:
+            self.btn_task_important.setText(t["to_important"])
+
+        if not self.current_task_id: 
+            self.task_title_label.setText(t["select_task"])
+            self.task_dates_label.setText("")
         self.btn_attach.setText(t["attach"])
         self.btn_send.setText(t["send"])
         self.post_input.setPlaceholderText(t["post_placeholder"])
@@ -1460,6 +1713,8 @@ class MainWindow(QMainWindow):
     def show_general_view(self):
         self.stacked_widget.setCurrentIndex(0)
         self.current_client_id = None 
+        self.btn_task_important.hide()
+        self.btn_task_archive.hide()
         self.load_general_data()
         t = TRANSLATIONS[self.current_lang]
         for i in range(self.clients_layout.count()):
@@ -1473,25 +1728,79 @@ class MainWindow(QMainWindow):
         self.general_tasks_list.clear()
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT t.id, t.title, t.is_important, c.id, c.name, t.created_at, t.deadline, t.recurrence FROM tasks t JOIN clients c ON t.client_id = c.id WHERE c.name != 'Общий' AND c.is_archived = 0 AND t.is_archived = 0 ORDER BY (t.recurrence = 'none' OR t.recurrence IS NULL) DESC, t.id DESC")
+        cursor.execute("SELECT t.id, t.title, t.is_important, c.id, c.name, t.created_at, t.deadline, t.recurrence FROM tasks t JOIN clients c ON t.client_id = c.id WHERE c.name != 'Общий' AND c.is_archived = 0 AND t.is_archived = 0")
         tasks = cursor.fetchall()
+        conn.close()
+        
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         max_date = datetime.now() + timedelta(days=365*5)
         dates_set = set()
         t_dict = TRANSLATIONS[self.current_lang]
-        for task_id, title, is_important, client_id, client_name, created_at, deadline, recurrence in tasks:
-            star = "⭐ " if is_important else ""
+        
+        tasks_with_dates = []
+        for t in tasks:
+            task_id, title, is_important, client_id, client_name, created_at, deadline, recurrence = t
+            next_date = get_next_occurrence(deadline, recurrence)
+            is_overdue = (next_date < today) and (recurrence == 'none' or not recurrence)
+            tasks_with_dates.append((t, next_date, is_overdue))
+            
+        tasks_with_dates.sort(key=lambda x: x[1])
+        
+        for t, next_date, is_overdue in tasks_with_dates:
+            task_id, title, is_important, client_id, client_name, created_at, deadline, recurrence = t
             display_title = title if len(title) < 40 else title[:40] + "..."
             recur_text = ""
             if recurrence == 'weekly': recur_text = f" ({t_dict['recur_weekly_short']})"
             elif recurrence == 'monthly': recur_text = f" ({t_dict['recur_monthly_short']})"
             elif recurrence == 'yearly': recur_text = f" ({t_dict['recur_yearly_short']})"
-            item_text = f"{star}{display_title}\n📅 {created_at}  ➔  {deadline}{recur_text}\n👤 {client_name}"
-            item = self.general_tasks_list.addItem(item_text)
-            self.general_tasks_list.item(self.general_tasks_list.count() - 1).setData(Qt.UserRole, (task_id, client_id))
+            
+            date_text = f"➔ {format_date_words(next_date, self.current_lang)}{recur_text}"
+            if next_date == datetime.max:
+                date_text = "➔ Нет дедлайна" if self.current_lang == "RU" else "➔ No deadline"
+                
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, (task_id, client_id))
+            item.setData(Qt.UserRole + 1, title)
+            
+            widget = QWidget()
+            layout = QVBoxLayout(widget)
+            layout.setContentsMargins(10, 5, 10, 5)
+            layout.setSpacing(2)
+            
+            if is_overdue:
+                widget.setStyleSheet("background-color: #faffb0; border-radius: 6px;")
+                
+            star = "⭐ " if is_important else ""
+            alert = "❗ " if is_overdue else ""
+            
+            title_lbl = ClickableLabel(f"{star}{alert}{display_title}")
+            title_lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #202124;")
+            title_lbl.clicked.connect(lambda checked=False, it=item, c_id=client_id, t_id=task_id: self.select_and_jump_from_general(c_id, t_id))
+            
+            date_lbl = ClickableLabel(date_text)
+            date_lbl.setStyleSheet("font-size: 12px; color: #5f6368;")
+            date_lbl.clicked.connect(lambda checked=False, it=item, c_id=client_id, t_id=task_id: self.select_and_jump_from_general(c_id, t_id))
+            
+            client_lbl = ClickableLabel(f"👤 {client_name}")
+            client_lbl.setStyleSheet("font-size: 12px; color: #5f6368;")
+            client_lbl.clicked.connect(lambda checked=False, it=item, c_id=client_id, t_id=task_id: self.select_and_jump_from_general(c_id, t_id))
+            
+            layout.addWidget(title_lbl)
+            layout.addWidget(date_lbl)
+            layout.addWidget(client_lbl)
+            
+            item.setSizeHint(widget.sizeHint())
+            self.general_tasks_list.addItem(item)
+            self.general_tasks_list.setItemWidget(item, widget)
+            
             for occ in get_all_occurrences(deadline, recurrence, max_date):
                 dates_set.add(QDate(occ.year, occ.month, occ.day))
-        conn.close()
-        for mini_cal in self.mini_calendars: mini_cal.set_task_dates(dates_set)
+                
+        for mini_cal in self.mini_calendars: 
+            mini_cal.set_task_dates(dates_set)
+
+    def select_and_jump_from_general(self, client_id, task_id):
+        self.jump_to_task(client_id, task_id)
 
     def on_general_task_clicked(self, item):
         data = item.data(Qt.UserRole)
@@ -1526,6 +1835,7 @@ class MainWindow(QMainWindow):
             mini_cal.setCurrentPage(year, month)
             mini_cal.setFixedHeight(180) 
             mini_cal.clicked.connect(self.on_general_calendar_clicked)
+            mini_cal.add_task_requested.connect(self.add_task_dialog)
             mini_cal.setStyleSheet("QCalendarWidget QWidget { background-color: #ffffff; } QCalendarWidget QAbstractItemView:enabled { background-color: #ffffff; color: #3c4043; }")
             month_layout.addWidget(mini_cal)
             self.calendar_grid_layout.addWidget(month_container, row, col)
@@ -1543,23 +1853,21 @@ class MainWindow(QMainWindow):
         cursor.execute("SELECT t.id, t.title, c.id, c.name, t.deadline, t.recurrence FROM tasks t JOIN clients c ON t.client_id = c.id WHERE c.name != 'Общий' AND c.is_archived = 0 AND t.is_archived = 0")
         all_tasks = cursor.fetchall()
         conn.close()
-        matched = [ (t[0], t[1], t[2], t[3]) for t in all_tasks if is_task_on_date(t[4], t[5], date) ]
+        
+        matched = []
+        for t in all_tasks:
+            if is_task_on_date(t[4], t[5], date):
+                matched.append((t[0], t[1], t[2], t[3], t[4], t[5]))
+                
         if not matched: return 
+        
         date_str = date.toString("dd.MM.yyyy")
-        if len(matched) == 1: self.jump_to_task(matched[0][2], matched[0][0])
+        if len(matched) == 1:
+            self.jump_to_task(matched[0][2], matched[0][0])
         else:
-            items = [f"{t[1]} ({t[3]})" for t in matched]
-            dialog = QInputDialog(self)
-            dialog.setWindowTitle("Выбор задачи" if self.current_lang == "RU" else "Select Task")
-            dialog.setLabelText(f"На {date_str} найдено несколько задач.\nВыберите нужную:" if self.current_lang == "RU" else f"Found multiple tasks on {date_str}.\nSelect one:")
-            dialog.setComboBoxItems(items)
-            dialog.setOkButtonText("ОК" if self.current_lang == "RU" else "OK")
-            dialog.setCancelButtonText("Отмена" if self.current_lang == "RU" else "Cancel")
+            dialog = SelectTaskDialog(self, matched, date_str)
             if dialog.exec() == QDialog.Accepted:
-                item = dialog.textValue()
-                if item:
-                    idx = items.index(item)
-                    self.jump_to_task(matched[idx][2], matched[idx][0])
+                self.jump_to_task(dialog.selected_client_id, dialog.selected_task_id)
 
     def jump_to_task(self, client_id, task_id):
         self.search_popup.hide() 
@@ -1617,12 +1925,15 @@ class MainWindow(QMainWindow):
     def select_client(self, client_id):
         self.current_client_id = client_id
         self.current_task_id = None
+        self.btn_task_important.hide()
+        self.btn_task_archive.hide()
         self.pending_post_files = []
         self.filter_date = None
         self.reset_filter_btn.hide()
         t = TRANSLATIONS[self.current_lang]
         self.btn_attach.setText(t["attach"])
-        self.task_title.setText(t["select_task"])
+        self.task_title_label.setText(t["select_task"])
+        self.task_dates_label.setText("")
         for i in range(self.clients_layout.count()):
             widget = self.clients_layout.itemAt(i).widget()
             if widget and widget.property("client_id") is not None:
@@ -1724,33 +2035,102 @@ class MainWindow(QMainWindow):
         if not self.current_client_id: return
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        query = "SELECT id, title, created_at, deadline, is_important, recurrence FROM tasks WHERE client_id = ? AND is_archived = 0 ORDER BY (recurrence = 'none' OR recurrence IS NULL) DESC, id DESC"
+        query = "SELECT id, title, created_at, deadline, is_important, recurrence FROM tasks WHERE client_id = ? AND is_archived = 0"
         cursor.execute(query, (self.current_client_id,))
         tasks = cursor.fetchall()
         conn.close()
+        
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         max_date = datetime.now() + timedelta(days=365*5)
         dates_set = set()
         t_dict = TRANSLATIONS[self.current_lang]
         filter_qdate = QDate.fromString(self.filter_date, "dd.MM.yyyy") if self.filter_date else None
-        for task_id, title, created_at, deadline, is_important, recurrence in tasks:
-            display_title = title if len(title) < 30 else title[:30] + "..."
+        
+        tasks_with_dates = []
+        for t in tasks:
+            task_id, title, created_at, deadline, is_important, recurrence = t
+            next_date = get_next_occurrence(deadline, recurrence)
+            is_overdue = (next_date < today) and (recurrence == 'none' or not recurrence)
+            tasks_with_dates.append((t, next_date, is_overdue))
+            
+        tasks_with_dates.sort(key=lambda x: x[1])
+        
+        for t, next_date, is_overdue in tasks_with_dates:
+            task_id, title, created_at, deadline, is_important, recurrence = t
+            
             if filter_qdate and not is_task_on_date(deadline, recurrence, filter_qdate): continue
+            
+            display_title = title if len(title) < 30 else title[:30] + "..."
             recur_text = ""
             if recurrence == 'weekly': recur_text = f" ({t_dict['recur_weekly_short']})"
             elif recurrence == 'monthly': recur_text = f" ({t_dict['recur_monthly_short']})"
             elif recurrence == 'yearly': recur_text = f" ({t_dict['recur_yearly_short']})"
-            item_text = f"{display_title}\n📅 {created_at}  ➔  {deadline}{recur_text}"
-            item = self.tasks_list.addItem(item_text)
-            last_item = self.tasks_list.item(self.tasks_list.count() - 1)
-            last_item.setData(Qt.UserRole, task_id)
-            last_item.setData(Qt.UserRole + 1, title)
+            
+            date_text = f"➔ {format_date_words(next_date, self.current_lang)}{recur_text}"
+            if next_date == datetime.max:
+                date_text = "➔ Нет дедлайна" if self.current_lang == "RU" else "➔ No deadline"
+            
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, task_id)
+            item.setData(Qt.UserRole + 1, title)
+            
+            widget = QWidget()
+            layout = QVBoxLayout(widget)
+            layout.setContentsMargins(10, 5, 10, 5)
+            layout.setSpacing(2)
+            
+            if is_overdue:
+                widget.setStyleSheet("background-color: #faffb0; border-radius: 6px;")
+                
+            star = "⭐ " if is_important else ""
+            alert = "❗ " if is_overdue else ""
+            
+            title_lbl = ClickableLabel(f"{star}{alert}{display_title}")
+            title_lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #202124;")
+            title_lbl.clicked.connect(lambda checked=False, it=item: self.on_task_clicked(it))
+            
+            date_lbl = ClickableLabel(date_text)
+            date_lbl.setStyleSheet("font-size: 12px; color: #5f6368;")
+            date_lbl.clicked.connect(lambda checked=False, it=item: self.on_task_clicked(it))
+            
+            layout.addWidget(title_lbl)
+            layout.addWidget(date_lbl)
+            
+            item.setSizeHint(widget.sizeHint())
+            self.tasks_list.addItem(item)
+            self.tasks_list.setItemWidget(item, widget)
+            
             if is_important:
-                self.important_list.addItem(item_text)
-                imp_item = self.important_list.item(self.important_list.count() - 1)
+                imp_item = QListWidgetItem()
                 imp_item.setData(Qt.UserRole, task_id)
                 imp_item.setData(Qt.UserRole + 1, title)
+                
+                imp_widget = QWidget()
+                imp_layout = QVBoxLayout(imp_widget)
+                imp_layout.setContentsMargins(10, 5, 10, 5)
+                imp_layout.setSpacing(2)
+                
+                if is_overdue:
+                    imp_widget.setStyleSheet("background-color: #faffb0; border-radius: 6px;")
+                    
+                imp_title_lbl = ClickableLabel(f"{star}{alert}{display_title}")
+                imp_title_lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #202124;")
+                imp_title_lbl.clicked.connect(lambda checked=False, it=imp_item: self.on_task_clicked(it))
+                
+                imp_date_lbl = ClickableLabel(date_text)
+                imp_date_lbl.setStyleSheet("font-size: 12px; color: #5f6368;")
+                imp_date_lbl.clicked.connect(lambda checked=False, it=imp_item: self.on_task_clicked(it))
+                
+                imp_layout.addWidget(imp_title_lbl)
+                imp_layout.addWidget(imp_date_lbl)
+                
+                imp_item.setSizeHint(imp_widget.sizeHint())
+                self.important_list.addItem(imp_item)
+                self.important_list.setItemWidget(imp_item, imp_widget)
+
             for occ in get_all_occurrences(deadline, recurrence, max_date):
                 dates_set.add(QDate(occ.year, occ.month, occ.day))
+                
         self.calendar.set_task_dates(dates_set)
         self.load_task_files()
 
@@ -1777,23 +2157,34 @@ class MainWindow(QMainWindow):
         self.load_tasks()
 
     def add_task_dialog(self, default_qdate=None):
-        if not self.current_client_id:
-            self.show_message("Ошибка" if self.current_lang == "RU" else "Error", "Сначала выберите клиента!" if self.current_lang == "RU" else "Select a client first!", QMessageBox.Warning)
-            return
+        if isinstance(default_qdate, QDate) and default_qdate.isValid():
+            pass
+        else:
+            default_qdate = None
+
         dialog = TaskDialog(self, default_qdate=default_qdate)
         dialog.setWindowTitle("Новая задача" if self.current_lang == "RU" else "New Task")
         if dialog.exec() == QDialog.Accepted:
             title = dialog.title_input.text().strip()
             deadline = dialog.deadline_input.date().toString("dd.MM.yyyy")
             recurrence = dialog.get_recurrence()
+            target_client_id = self.current_client_id
+            if dialog.client_combo is not None:
+                target_client_id = dialog.client_combo.currentData()
+                
+            if not target_client_id:
+                self.show_message("Ошибка" if self.current_lang == "RU" else "Error", "Не выбран клиент!" if self.current_lang == "RU" else "Client not selected!", QMessageBox.Warning)
+                return
+                
             if title:
                 conn = sqlite3.connect(DB_PATH)
                 cursor = conn.cursor()
                 today = datetime.now().strftime("%d.%m.%Y")
-                cursor.execute("INSERT INTO tasks (client_id, title, created_at, deadline, recurrence) VALUES (?, ?, ?, ?, ?)", (self.current_client_id, title, today, deadline, recurrence))
+                cursor.execute("INSERT INTO tasks (client_id, title, created_at, deadline, recurrence) VALUES (?, ?, ?, ?, ?)", (target_client_id, title, today, deadline, recurrence))
                 conn.commit()
                 conn.close()
                 self.load_tasks()
+                self.load_general_data()
 
     def edit_task_dialog(self, item):
         task_id = item.data(Qt.UserRole)
@@ -1817,38 +2208,77 @@ class MainWindow(QMainWindow):
                     conn.commit()
                     conn.close()
                     self.load_tasks()
-                    if self.current_task_id == task_id: self.task_title.setText(new_title)
+                    if self.current_task_id == task_id: 
+                        self.task_title_label.setText(new_title)
+                        next_date = get_next_occurrence(new_deadline, new_recurrence)
+                        date_str = format_date_words(next_date, self.current_lang)
+                        if new_recurrence != 'none':
+                            t_dict = TRANSLATIONS[self.current_lang]
+                            date_str += f" ({t_dict[f'recur_{new_recurrence}_short']})"
+                        self.task_dates_label.setText(f"➔ {date_str}")
+                    self.load_general_data()
 
     def on_task_clicked(self, item):
         task_id = item.data(Qt.UserRole)
         full_task_title = item.data(Qt.UserRole + 1) 
         self.current_task_id = task_id
-        self.task_title.setText(full_task_title)
+        self.task_title_label.setText(full_task_title)
         self.pending_post_files = []
         self.btn_attach.setText(TRANSLATIONS[self.current_lang]["attach"])
         self.post_input.setEnabled(True)
         self.btn_send.setEnabled(True)
         self.btn_attach.setEnabled(True)
+        
+        self.btn_task_important.show()
+        self.btn_task_archive.show()
+        
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT created_at, deadline, recurrence, is_important FROM tasks WHERE id = ?", (task_id,))
+        res = cursor.fetchone()
+        conn.close()
+        
+        if res:
+            created_at, deadline, recurrence, is_important = res
+            next_date = get_next_occurrence(deadline, recurrence)
+            date_str = f"{format_date_words(datetime.strptime(created_at, '%d.%m.%Y'), self.current_lang)} ➔ {format_date_words(next_date, self.current_lang)}"
+            if recurrence != 'none':
+                t_dict = TRANSLATIONS[self.current_lang]
+                date_str += f" ({t_dict[f'recur_{recurrence}_short']})"
+            self.task_dates_label.setText(date_str)
+            
+            t = TRANSLATIONS[self.current_lang]
+            if is_important:
+                self.btn_task_important.setText(t["remove_important"])
+            else:
+                self.btn_task_important.setText(t["to_important"])
+            
         self.load_posts()
         self.load_task_files()
 
-    def show_task_context_menu(self, pos):
-        widget = self.sender()
-        item = widget.itemAt(pos)
-        if not item: return
-        task_id = item.data(Qt.UserRole)
-        menu = QMenu()
-        action_important = menu.addAction("⭐ Отметить как важную / Снять важность" if self.current_lang == "RU" else "⭐ Mark as important / Unmark")
-        action_archive = menu.addAction(TRANSLATIONS[self.current_lang]["to_archive"])
-        action = menu.exec(widget.mapToGlobal(pos))
-        if action == action_important:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("UPDATE tasks SET is_important = 1 - is_important WHERE id = ?", (task_id,))
-            conn.commit()
-            conn.close()
-            self.load_tasks()
-        elif action == action_archive: self.archive_task(task_id)
+    def toggle_current_task_important(self):
+        if not self.current_task_id: return
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE tasks SET is_important = 1 - is_important WHERE id = ?", (self.current_task_id,))
+        conn.commit()
+        
+        cursor.execute("SELECT is_important FROM tasks WHERE id = ?", (self.current_task_id,))
+        is_imp = cursor.fetchone()[0]
+        conn.close()
+        
+        t = TRANSLATIONS[self.current_lang]
+        if is_imp:
+            self.btn_task_important.setText(t["remove_important"])
+        else:
+            self.btn_task_important.setText(t["to_important"])
+            
+        self.load_tasks()
+        self.load_general_data()
+
+    def archive_current_task(self):
+        if self.current_task_id:
+            self.archive_task(self.current_task_id)
 
     def archive_task(self, task_id):
         conn = sqlite3.connect(DB_PATH)
@@ -1858,10 +2288,13 @@ class MainWindow(QMainWindow):
         conn.close()
         if self.current_task_id == task_id:
             self.current_task_id = None
-            self.task_title.setText(TRANSLATIONS[self.current_lang]["select_task"])
+            self.task_title_label.setText(TRANSLATIONS[self.current_lang]["select_task"])
+            self.task_dates_label.setText("")
             self.post_input.setEnabled(False)
             self.btn_send.setEnabled(False)
             self.btn_attach.setEnabled(False)
+            self.btn_task_important.hide()
+            self.btn_task_archive.hide()
             self.clear_posts()
             self.task_files_list.clear()
         self.load_tasks()
@@ -1880,6 +2313,8 @@ class MainWindow(QMainWindow):
     def show_archive_view(self):
         self.stacked_widget.setCurrentIndex(2)
         self.current_client_id = None
+        self.btn_task_important.hide()
+        self.btn_task_archive.hide()
         self.load_archive_tasks()
         for i in range(self.clients_layout.count()):
             widget = self.clients_layout.itemAt(i).widget()
@@ -1987,9 +2422,12 @@ class MainWindow(QMainWindow):
                         try: shutil.rmtree(task_dir)
                         except: pass
                 self.load_archive_tasks()
+
     def show_all_clients_view(self):
         self.stacked_widget.setCurrentIndex(3)
         self.current_client_id = None
+        self.btn_task_important.hide()
+        self.btn_task_archive.hide()
         self.all_clients_filter = ""
         self.client_search_input.clear()
         self.btn_clear_client_search.hide()
@@ -2020,12 +2458,9 @@ class MainWindow(QMainWindow):
         all_clients = cursor.fetchall()
         conn.close()
 
-        # Регистронезависимый поиск (работает и для кириллицы)
         if self.all_clients_filter:
             needle = self.all_clients_filter.lower()
-            clients = [c for c in all_clients
-                       if needle in (c[1] or '').lower()
-                       or needle in (c[2] or '').lower()]
+            clients = [c for c in all_clients if needle in (c[1] or '').lower() or needle in (c[2] or '').lower()]
         else:
             clients = all_clients
 
@@ -2059,7 +2494,6 @@ class MainWindow(QMainWindow):
             text_layout.setSpacing(2)
             text_layout.addWidget(lbl_name)
 
-            # Описание через MultiLineElidedLabel (макс. 5 строк с "...")
             if desc:
                 lbl_desc = MultiLineElidedLabel(desc)
                 text_layout.addWidget(lbl_desc)
@@ -2086,7 +2520,6 @@ class MainWindow(QMainWindow):
                 btn_restore.clicked.connect(lambda checked=False, cid=client_id: self.restore_client(cid))
                 h.addWidget(btn_restore, alignment=Qt.AlignVCenter)
 
-            # Динамическая высота: 150px с описанием, 60px без
             item.setSizeHint(QSize(0, 150 if desc else 60))
             item.setData(Qt.UserRole, client_id)
             item.setData(Qt.UserRole + 1, is_archived)
@@ -2095,22 +2528,17 @@ class MainWindow(QMainWindow):
 
     def show_all_clients_item_context_menu(self, pos):
         item = self.all_clients_list.itemAt(pos)
-        if not item:
-            return
+        if not item: return
         widget = self.all_clients_list.itemWidget(item)
-        if not widget:
-            return
-        # Проверка чекбокса: если клик пришёлся на него — меню не показываем
+        if not widget: return
         cb = widget.findChild(QCheckBox)
         if cb and cb.isEnabled():
             cb_rect = cb.rect()
             cb_rect.moveTopLeft(cb.mapTo(self.all_clients_list.viewport(), QPoint(0, 0)))
-            if cb_rect.contains(pos):
-                return
+            if cb_rect.contains(pos): return
         client_id = item.data(Qt.UserRole)
         is_archived = item.data(Qt.UserRole + 1)
-        if client_id is None:
-            return
+        if client_id is None: return
         menu = QMenu()
         t = TRANSLATIONS[self.current_lang]
         action_edit = menu.addAction(t["edit_client"])
@@ -2127,8 +2555,7 @@ class MainWindow(QMainWindow):
             cursor.execute("SELECT name FROM clients WHERE id = ?", (client_id,))
             row = cursor.fetchone()
             conn.close()
-            if row:
-                self.delete_client(client_id, row[0])
+            if row: self.delete_client(client_id, row[0])
 
     def on_client_checkbox_changed(self):
         any_checked = False
@@ -2318,6 +2745,97 @@ class MainWindow(QMainWindow):
                 conn.close()
                 self.load_contacts()
 
+    def export_contacts(self):
+        if not self.current_client_id: return
+        title = "Экспорт контактов" if self.current_lang == "RU" else "Export Contacts"
+        file_path, _ = QFileDialog.getSaveFileName(self, title, "contacts.vcf", "vCard Files (*.vcf)")
+        if not file_path: return
+        
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, description, phone1, phone2, phone3, email1, email2, email3 FROM contacts WHERE client_id = ?", (self.current_client_id,))
+        contacts = cursor.fetchall()
+        conn.close()
+        
+        if not contacts:
+            self.show_message("Инфо" if self.current_lang == "RU" else "Info", "Нет контактов для экспорта." if self.current_lang == "RU" else "No contacts to export.", QMessageBox.Information)
+            return
+
+        vcard_lines = []
+        for c in contacts:
+            name, desc, p1, p2, p3, e1, e2, e3 = c
+            vcard_lines.append("BEGIN:VCARD")
+            vcard_lines.append("VERSION:3.0")
+            vcard_lines.append(f"FN:{name}")
+            vcard_lines.append(f"N:{name};;;;")
+            if desc: vcard_lines.append(f"NOTE:{desc.replace(chr(10), '\\n')}")
+            if p1: vcard_lines.append(f"TEL;TYPE=CELL:{p1}")
+            if p2: vcard_lines.append(f"TEL;TYPE=CELL:{p2}")
+            if p3: vcard_lines.append(f"TEL;TYPE=CELL:{p3}")
+            if e1: vcard_lines.append(f"EMAIL;TYPE=INTERNET:{e1}")
+            if e2: vcard_lines.append(f"EMAIL;TYPE=INTERNET:{e2}")
+            if e3: vcard_lines.append(f"EMAIL;TYPE=INTERNET:{e3}")
+            vcard_lines.append("END:VCARD")
+            
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write("\r\n".join(vcard_lines))
+            self.show_message("Успех" if self.current_lang == "RU" else "Success", f"Экспортировано {len(contacts)} контактов." if self.current_lang == "RU" else f"Exported {len(contacts)} contacts.", QMessageBox.Information)
+        except Exception as e:
+            self.show_message("Ошибка" if self.current_lang == "RU" else "Error", f"Не удалось сохранить файл:\n{e}" if self.current_lang == "RU" else f"Failed to save file:\n{e}", QMessageBox.Critical)
+
+    def import_contacts(self):
+        if not self.current_client_id: return
+        title = "Импорт контактов" if self.current_lang == "RU" else "Import Contacts"
+        file_path, _ = QFileDialog.getOpenFileName(self, title, "", "vCard Files (*.vcf)")
+        if not file_path: return
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            self.show_message("Ошибка" if self.current_lang == "RU" else "Error", f"Не удалось прочитать файл:\n{e}" if self.current_lang == "RU" else f"Failed to read file:\n{e}", QMessageBox.Critical)
+            return
+
+        parsed_contacts = []
+        current_contact = {"name": "", "desc": "", "phones": [], "emails": []}
+        
+        for line in text.splitlines():
+            line = line.strip()
+            if line == "BEGIN:VCARD":
+                current_contact = {"name": "", "desc": "", "phones": [], "emails": []}
+            elif line == "END:VCARD":
+                if current_contact["name"]:
+                    parsed_contacts.append(current_contact)
+            elif line.startswith("FN:"):
+                current_contact["name"] = line[3:].replace("\\n", "\n").replace("\\,", ",")
+            elif line.startswith("NOTE:"):
+                current_contact["desc"] = line[5:].replace("\\n", "\n").replace("\\,", ",")
+            elif line.startswith("TEL"):
+                parts = line.split(":", 1)
+                if len(parts) == 2: current_contact["phones"].append(parts[1])
+            elif line.startswith("EMAIL"):
+                parts = line.split(":", 1)
+                if len(parts) == 2: current_contact["emails"].append(parts[1])
+                
+        if not parsed_contacts:
+            self.show_message("Инфо" if self.current_lang == "RU" else "Info", "В файле не найдено контактов." if self.current_lang == "RU" else "No contacts found in file.", QMessageBox.Information)
+            return
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        for c in parsed_contacts:
+            p = c["phones"] + ["", "", ""]
+            e = c["emails"] + ["", "", ""]
+            cursor.execute('''INSERT INTO contacts (client_id, name, description, phone1, phone2, phone3, email1, email2, email3) 
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
+                           (self.current_client_id, c["name"], c["desc"], p[0], p[1], p[2], e[0], e[1], e[2]))
+        conn.commit()
+        conn.close()
+        
+        self.load_contacts()
+        self.show_message("Успех" if self.current_lang == "RU" else "Success", f"Импортировано {len(parsed_contacts)} контактов." if self.current_lang == "RU" else f"Imported {len(parsed_contacts)} contacts.", QMessageBox.Information)
+
     def add_client_file(self):
         if not self.current_client_id:
             self.show_message("Ошибка" if self.current_lang == "RU" else "Error", "Сначала выберите клиента!" if self.current_lang == "RU" else "Select a client first!", QMessageBox.Warning)
@@ -2496,6 +3014,7 @@ class MainWindow(QMainWindow):
             layout.addWidget(date_label)
             text_label = QLabel(text)
             text_label.setWordWrap(True)
+            text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
             text_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred) 
             text_label.setStyleSheet("font-size: 14px; margin-top: 5px;")
             layout.addWidget(text_label)
@@ -2618,7 +3137,7 @@ if __name__ == "__main__":
         #textBtn:hover { background-color: #f1f3f4; }
         #sectionTitle { font-size: 15px; font-weight: bold; color: #202124; padding-top: 5px; }
         QListWidget { border: none; background-color: transparent; outline: none; }
-        QListWidget::item { padding: 8px; border-radius: 4px; color: #3c4043; }
+        QListWidget::item { padding: 0px; border-radius: 4px; color: #3c4043; }
         QListWidget::item:hover { background-color: #f1f3f4; }
         QListWidget::item:selected { background-color: #e8f0fe; color: #1967d2; }
         #activeTaskTitle { background-color: #e8f0fe; color: #202124; padding: 12px; border-radius: 6px; font-size: 13px; font-weight: bold; }
